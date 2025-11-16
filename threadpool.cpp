@@ -18,14 +18,7 @@ ThreadPool::ThreadPool()
 
 ThreadPool::~ThreadPool()
 {
-    {
-        std::unique_lock<std::mutex> lock(taskQueMtx_);
-        isPoolRunning_ = false;
-        notEmpty.notify_all();
-    }
-    std::unique_lock<std::mutex> lock(taskQueMtx_);
-    exitCond_.wait(lock, [&]() -> bool
-                   { return threads_.size() == 0; });
+    shutdown();
 }
 
 void ThreadPool::setMode(PoolMode mode)
@@ -35,6 +28,15 @@ void ThreadPool::setMode(PoolMode mode)
         return;
     }
     poolMode_ = mode;
+}
+
+void ThreadPool::setPolicy(RejectionPolicy policy)
+{
+    if (checkRunningState())
+    {
+        return;
+    }
+    rejectionPolicy_ = policy;
 }
 
 void ThreadPool::setTaskQueMaxThreshHold(int threshhold)
@@ -66,7 +68,6 @@ void ThreadPool::start(int initThreadSize)
     initThreadSize_ = initThreadSize;
     curThreadSize_ = initThreadSize;
 
-    // 创建线程对象
     for (int i = 0; i < initThreadSize_; i++)
     {
         auto ptr = std::make_unique<Thread>(std::bind(&ThreadPool::threadFunc, this, std::placeholders::_1));
@@ -78,6 +79,40 @@ void ThreadPool::start(int initThreadSize)
     {
         pair.second->start();
     }
+}
+
+void ThreadPool::shutdown()
+{
+    {
+        std::unique_lock<std::mutex> lock(taskQueMtx_);
+        isPoolRunning_ = false;
+        notEmpty.notify_all();
+    }
+
+    std::unique_lock<std::mutex> lock(taskQueMtx_);
+    exitCond_.wait(lock, [&]() -> bool
+                   { return threads_.size() == 0; });
+}
+
+int ThreadPool::getCurrentThreadCount() const
+{
+    return curThreadSize_;
+}
+
+int ThreadPool::getIdleThreadCount() const
+{
+    return idleThreadSize_;
+}
+
+int ThreadPool::getActiveThreadCount() const
+{
+    return curThreadSize_ - idleThreadSize_;
+}
+
+size_t ThreadPool::getTaskQueueSize()
+{
+    std::unique_lock<std::mutex> lock(taskQueMtx_);
+    return taskQue_.size();
 }
 
 void ThreadPool::threadFunc(int threadid)
@@ -136,7 +171,7 @@ void ThreadPool::threadFunc(int threadid)
 
             idleThreadSize_--;
             // 获取任务
-            aTask = std::move(const_cast<myTask&>(taskQue_.top()));
+            aTask = std::move(const_cast<myTask &>(taskQue_.top()));
             taskQue_.pop();
 
             // 通知其他线程还有任务
@@ -152,7 +187,7 @@ void ThreadPool::threadFunc(int threadid)
         // 执行任务
         if (aTask.task)
         {
-           aTask.task->execute();
+            aTask.task->execute();
         }
         lastTime = std::chrono::high_resolution_clock::now();
     }
@@ -163,18 +198,20 @@ bool ThreadPool::checkRunningState() const
     return isPoolRunning_;
 }
 
-////////Thread
-std::atomic_int Thread::generateId_ = 0;
+// ======== Thread 类实现 (已添加作用域) =========
 
-Thread::Thread(ThreadFunc func) : func_(func), threadId_(generateId_.fetch_add(1)) {}
+std::atomic_int ThreadPool::Thread::generateId_ = 0;
 
-void Thread::start()
+ThreadPool::Thread::Thread(ThreadFunc func)
+    : func_(func), threadId_(generateId_.fetch_add(1)) {}
+
+void ThreadPool::Thread::start()
 {
     std::thread t(func_, threadId_);
     t.detach();
 }
 
-int Thread::getId() const
+int ThreadPool::Thread::getId() const
 {
     return threadId_;
 }
