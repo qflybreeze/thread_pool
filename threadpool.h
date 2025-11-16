@@ -35,6 +35,50 @@ private:
     int threadId_; // 保存线程id以便回收
 };
 
+class ITask
+{
+public:
+    virtual ~ITask() = default;
+    virtual void execute() = 0;
+};
+
+template <typename R>
+class ConcreteTask : public ITask
+{
+public:
+    std::packaged_task<R()> task_;
+
+    ConcreteTask(std::packaged_task<R()> &&task) : task_(std::move(task)) {}
+
+    void execute() override
+    {
+        task_();
+    }
+};
+
+class myTask
+{
+public:
+    int weight_; // 任务权重,权重越大优先级越高
+    std::unique_ptr<ITask> task;
+    myTask() = default;
+    myTask(std::unique_ptr<ITask> t, int w = 0);
+    myTask(myTask &&other) noexcept;
+    ~myTask() = default;
+    myTask &operator=(myTask &&other) noexcept
+    {
+        weight_ = other.weight_;
+        task = std::move(other.task);
+        return *this;
+    }
+    bool operator<(const myTask &a) const
+    {
+        return weight_ < a.weight_; // 权重越大优先级越高
+    }
+    myTask(const myTask &) = delete;
+    myTask &operator=(const myTask &) = delete;
+};
+
 class ThreadPool
 {
 public:
@@ -48,64 +92,10 @@ public:
     void setThreadSizeThreshHold(int threshhold);
 
     template <typename Func, typename... Args>
-    auto submitTask(Func &&func, Args &&...args) -> std::future<decltype(func(args...))>
-    {
-        using RType = decltype(func(args...));
-        auto task = std::make_shared<std::packaged_task<RType()>>(
-            std::bind(std::forward<Func>(func), std::forward<Args>(args)...));
-        std::future<RType> result = task->get_future();
+    auto submitTask(Func &&func, Args &&...args) -> std::future<decltype(func(args...))>;
 
-        Thread *newThreadPtr = nullptr;
-        // 获取锁
-        std::unique_lock<std::mutex> lock(taskQueMtx_);
-        // 等待任务队列有空余
-        if (!notFull.wait_for(lock, std::chrono::seconds(1),
-                              [&]() -> bool
-                              { return taskQue_.size() < (size_t)taskQueMaxThreshHold_; }))
-        {
-            std::cerr << "submit task timeout" << std::endl;
-            if constexpr (std::is_void_v<RType>)
-            {
-                auto time_out_task = std::make_shared<std::packaged_task<void()>>([]() {});
-                (*time_out_task)();
-                return time_out_task->get_future();
-            }
-            else
-            {
-                auto time_out_task = std::make_shared<std::packaged_task<RType()>>(
-                    []() -> RType
-                    { return RType(); });
-                (*time_out_task)();
-                return time_out_task->get_future();
-            }
-        }
-        // 添加任务
-        taskQue_.emplace([task]()
-                         { (*task)(); });
-        // 通知线程处理任务
-        notEmpty.notify_one();
-
-        // cache模式
-        if (poolMode_ == PoolMode::MODE_CACHED && taskQue_.size() > (size_t)idleThreadSize_ && curThreadSize_ < threadSizeThreshHold_)
-        {
-            // 创建新线程
-            auto ptr = std::make_unique<Thread>(std::bind(&ThreadPool::threadFunc, this, std::placeholders::_1));
-            int threadId = ptr->getId();
-            newThreadPtr = ptr.get();
-            threads_.emplace(threadId, std::move(ptr));
-
-            curThreadSize_++;
-        }
-
-        lock.unlock(); // 先释放锁,在锁外启动新线程
-
-        if (newThreadPtr != nullptr)
-        {
-            newThreadPtr->start();
-        }
-
-        return result;
-    }
+    template <typename Func, typename... Args>
+    auto submitTaskWithPriority(int priority, Func &&func, Args &&...args) -> std::future<decltype(func(args...))>;
 
     void start(int initThreadSize = std::thread::hardware_concurrency());
 
@@ -127,8 +117,8 @@ private:
     std::atomic_int curThreadSize_;  // 当前线程数量
     std::atomic_int idleThreadSize_; // 空闲线程数量
 
-    using Task = std::function<void()>;
-    std::queue<Task> taskQue_;
+    // using Task = std::function<void()>;
+    std::priority_queue<myTask> taskQue_;
     int taskQueMaxThreshHold_; // 任务数量上限
 
     std::mutex taskQueMtx_;
@@ -141,4 +131,60 @@ private:
     std::atomic_bool isPoolRunning_;
 };
 
+template <typename Func, typename... Args>
+auto ThreadPool::submitTask(Func &&func, Args &&...args) -> std::future<decltype(func(args...))>
+{
+    return submitTaskWithPriority(0, std::forward<Func>(func), std::forward<Args>(args)...);
+}
+
+template <typename Func, typename... Args>
+auto ThreadPool::submitTaskWithPriority(int priority, Func &&func, Args &&...args) -> std::future<decltype(func(args...))>
+{
+    using RType = decltype(func(args...));
+    // auto task = std::make_shared<std::packaged_task<RType()>>(std::bind(std::forward<Func>(func), std::forward<Args>(args)...));
+    auto bound_func = std::bind(std::forward<Func>(func), std::forward<Args>(args)...);
+    auto packaged_task = std::packaged_task<RType()>(std::move(bound_func));
+
+    auto task_ptr = std::make_unique<ConcreteTask<RType>>(std::move(packaged_task));
+
+    std::future<RType> result = task->get_future();
+
+    Thread *newThreadPtr = nullptr;
+    std::unique_lock<std::mutex> lock(taskQueMtx_);
+
+    if (!notFull.wait_for(lock, std::chrono::seconds(1),
+                          [&]() -> bool
+                          { return taskQue_.size() < (size_t)taskQueMaxThreshHold_; }))
+    {
+        std::cerr << "submit task timeout" << std::endl;
+        throw std::runtime_error("Task queue is full, submit task timeout after 1 second");
+    }
+
+    // 添加带权重的任务
+    // auto taskFunc = std::make_shared<std::function<void()>>([task]() { (*task)(); });
+    // taskQue_.emplace(taskFunc, priority);
+    taskQue_.emplace(std::move(task_ptr), priority);
+    notEmpty.notify_one();
+
+    if (poolMode_ == PoolMode::MODE_CACHED &&
+        taskQue_.size() > (size_t)idleThreadSize_ &&
+        curThreadSize_ < threadSizeThreshHold_)
+    {
+        auto ptr = std::make_unique<Thread>(
+            std::bind(&ThreadPool::threadFunc, this, std::placeholders::_1));
+        int threadId = ptr->getId();
+        newThreadPtr = ptr.get();
+        threads_.emplace(threadId, std::move(ptr));
+        curThreadSize_++;
+    }
+
+    lock.unlock();
+
+    if (newThreadPtr != nullptr)
+    {
+        newThreadPtr->start();
+    }
+
+    return result;
+}
 #endif // THREADPOOL_H

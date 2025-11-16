@@ -86,7 +86,7 @@ void ThreadPool::threadFunc(int threadid)
 
     while (true)
     {
-        Task task;
+        myTask aTask;
         {
             // 获取锁
             std::unique_lock<std::mutex> lock(taskQueMtx_);
@@ -136,7 +136,7 @@ void ThreadPool::threadFunc(int threadid)
 
             idleThreadSize_--;
             // 获取任务
-            task = std::move(taskQue_.front());
+            aTask = std::move(const_cast<myTask&>(taskQue_.top()));
             taskQue_.pop();
 
             // 通知其他线程还有任务
@@ -150,9 +150,9 @@ void ThreadPool::threadFunc(int threadid)
         } // 释放锁
 
         // 执行任务
-        if (task)
+        if (aTask.task)
         {
-            task();
+           aTask.task->execute();
         }
         lastTime = std::chrono::high_resolution_clock::now();
     }
